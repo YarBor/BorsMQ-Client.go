@@ -2,6 +2,7 @@ package BorsMQ_Client_go
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/YarBor/BorsMqServer/api"
 	"google.golang.org/grpc"
@@ -148,6 +149,7 @@ func (s *brokersGroup) GetLink() (func() (*link, error), func()) {
 
 type partition struct {
 	mu          sync.RWMutex // guards
+	t           string
 	p           string
 	bks         *brokersGroup
 	commitIndex int64
@@ -221,18 +223,19 @@ func (p *partition) Pull(
 }
 
 const (
-	ConsumerInstance_mode_normal   int32 = 0
-	ConsumerInstance_mode_updating int32 = 1
-	ConsumerInstance_mode_close    int32 = 2
+	ConsumerInstance_mode_Uncheck  int32 = 0
+	ConsumerInstance_mode_normal   int32 = 1
+	ConsumerInstance_mode_updating int32 = 2
 )
 
-type ConsumerInstance struct {
+type consumerInstance struct {
 	mode            int32
 	Self            *api.Credentials
 	Group           *api.Credentials
+	register        link
+	Key             string
 	ConsumerID      string
 	ConsumerGroupID string
-	followTopic     string
 	wg              sync.WaitGroup
 	IsStop          bool
 
@@ -241,33 +244,39 @@ type ConsumerInstance struct {
 	followPart  map[string]*partition
 	getPartFunc func() *partition
 
-	maxWindowSize   int32
-	timeoutSessions int32
-	getEntryNum     int32
-	MsgChan         chan *MsgData
+	maxWindowSize      int32
+	timeoutSessions    int32
+	defaultGetEntryNum int32
+	MsgChan            chan *MsgData
 }
 
-func newConsumerInstance() *ConsumerInstance {
-	return &ConsumerInstance{
-		mode:            ConsumerInstance_mode_normal,
+func newConsumerInstance() *consumerInstance {
+	return &consumerInstance{
+		mode:            ConsumerInstance_mode_Uncheck,
 		Self:            nil,
 		Group:           nil,
 		ConsumerID:      "",
 		ConsumerGroupID: "",
-		followTopic:     "",
-		wg:              sync.WaitGroup{},
-		IsStop:          false,
-		mu:              sync.Mutex{},
-		term:            0,
-		followPart:      make(map[string]*partition),
-		getPartFunc:     nil,
-		maxWindowSize:   0,
-		timeoutSessions: 0,
-		getEntryNum:     0,
-		MsgChan:         make(chan *MsgData),
+		register: link{
+			id:        "",
+			url:       "",
+			conn:      nil,
+			clientEnd: nil,
+		},
+		Key:                "",
+		wg:                 sync.WaitGroup{},
+		IsStop:             false,
+		mu:                 sync.Mutex{},
+		term:               0,
+		followPart:         make(map[string]*partition),
+		getPartFunc:        nil,
+		maxWindowSize:      0,
+		timeoutSessions:    0,
+		defaultGetEntryNum: 0,
+		MsgChan:            make(chan *MsgData),
 	}
 }
-func (c *ConsumerInstance) Stop() {
+func (c *consumerInstance) Stop() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.IsStop = true
@@ -280,7 +289,7 @@ func (c *ConsumerInstance) Stop() {
 	c.wg.Wait()
 }
 
-func (c *ConsumerInstance) newGetPartFunc() {
+func (c *consumerInstance) newGetPartFunc() {
 	c.mu.Lock()                      // 锁定互斥量，以确保并发安全
 	defer c.mu.Unlock()              // 在函数返回后解锁互斥量
 	parts := []*string{}             // 创建一个存储分区的切片
@@ -312,29 +321,39 @@ func (c *ConsumerInstance) newGetPartFunc() {
 	}
 }
 
-func (c *ConsumerInstance) Pull(numMessage int32) (*MsgData, error) {
+func (c *consumerInstance) Pull() (*MsgData, error) {
+	return c.PullwithNum(c.defaultGetEntryNum)
+}
+
+func (c *consumerInstance) PullwithNum(GetEntryNum int32) (*MsgData, error) {
+	if atomic.LoadInt32(&c.mode) == ConsumerInstance_mode_Uncheck {
+		return nil, errors.New("Need To Build Consumer Instance ")
+	}
 start:
 	getPart := c.getPartFunc() // 获取一个分区
 	if getPart == nil {        // 如果获取到的分区为空
 		c.newGetPartFunc()        // 重新生成getPartFunc闭包函数
 		getPart = c.getPartFunc() // 获取新生成的分区
 		if getPart == nil {       // 如果仍然获取不到分区
-			return nil, fmt.Errorf("There is no partition with topic belong this instance %s", c.followTopic)
+			return nil, fmt.Errorf("There is no partition with topic belong this instance %s", getPart.t)
 		}
 	}
-	getPart.signPull(numMessage) // 向获取到的分区发送消息数目
-	data, ok := <-c.MsgChan      // 从消息通道接收数据
-	if ok {                      // 如果接收到数据
+	getPart.signPull(GetEntryNum) // 向获取到的分区发送消息数目
+	data, ok := <-c.MsgChan       // 从消息通道接收数据
+	if ok {                       // 如果接收到数据
 		if data == nil { // 如果接收到的数据为空 // means partition is empty or partition will be deleted
 			goto start // 跳转到标签start，重新获取分区并继续执行
 		}
 		return data, nil // 返回接收到的数据
 	} else { // 如果通道已关闭
-		panic(fmt.Sprintf("Partition [%s-%s] is not available", c.followTopic, getPart.p))
+		panic(fmt.Sprintf("Partition [%s-%s] is not available", getPart.t, getPart.p))
 	}
 }
 
-func (c *ConsumerInstance) registerPartition(p string, members ...struct{ ID, Url string }) error {
+func (c *consumerInstance) registerPartition(p string, members ...struct{ ID, Url string }) error {
+	if atomic.LoadInt32(&c.mode) == ConsumerInstance_mode_Uncheck {
+		return errors.New("Need To Build Consumer Instance ")
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	newPart, ok := c.followPart[p]
@@ -353,16 +372,16 @@ func (c *ConsumerInstance) registerPartition(p string, members ...struct{ ID, Ur
 	return nil
 }
 
-// goPullHeartbeat 是 ConsumerInstance 结构体的方法，用于从指定分区拉取消息。
-// 它使用了一个计时器来定期拉取消息，直到 ConsumerInstance 停止或者接收到停止信号为止。
-func (c *ConsumerInstance) goPullHeartbeat(p *partition) {
+// goPullHeartbeat 是 consumerInstance 结构体的方法，用于从指定分区拉取消息。
+// 它使用了一个计时器来定期拉取消息，直到 consumerInstance 停止或者接收到停止信号为止。
+func (c *consumerInstance) goPullHeartbeat(p *partition) {
 	// 在函数退出时标记 WaitGroup 为完成
 	defer c.wg.Done()
 
 	// 创建一个立即触发的计时器
 	timer := time.NewTimer(0)
 
-	// 循环直到 ConsumerInstance 停止
+	// 循环直到 consumerInstance 停止
 	for !c.IsStop {
 		// 标记是否计时器超时
 		Timeout := false
@@ -389,7 +408,7 @@ func (c *ConsumerInstance) goPullHeartbeat(p *partition) {
 		}
 
 		// 拉取消息
-		res, err := p.Pull(c.Group, c.Self, term, num, c.followTopic, p.p)
+		res, err := p.Pull(c.Group, c.Self, term, num, p.t, p.p)
 		if err != nil {
 			log.Printf("Error pulling messages: %v", err)
 		}
@@ -400,7 +419,7 @@ func (c *ConsumerInstance) goPullHeartbeat(p *partition) {
 			if res.Msgs.Message != nil && len(res.Msgs.Message) != 0 {
 				// 收到消息，发送到 MsgChan，并在确认后更新 commitIndex
 				c.MsgChan <- &MsgData{
-					T:    c.followTopic,
+					T:    p.t,
 					P:    p.p,
 					Data: res.Msgs.Message,
 					Ack: func() {
@@ -440,15 +459,19 @@ func (c *ConsumerInstance) goPullHeartbeat(p *partition) {
 }
 
 // UpdateConsumerGroupFollowPartition 用于更新消费者组跟随的分区信息。
-func (c *ConsumerInstance) UpdateConsumerGroupFollowPartition(p *partition) {
-	// 检查并尝试将 ConsumerInstance 的模式从正常模式切换到更新模式
+func (c *consumerInstance) UpdateConsumerGroupFollowPartition(p *partition) {
+	if atomic.LoadInt32(&c.mode) == ConsumerInstance_mode_Uncheck {
+		log.Print(errors.New("Need To Build Consumer Instance ").Error())
+		return
+	}
+	// 检查并尝试将 consumerInstance 的模式从正常模式切换到更新模式
 	if atomic.CompareAndSwapInt32(&c.mode, ConsumerInstance_mode_normal, ConsumerInstance_mode_updating) {
 		// 增加 WaitGroup 的计数，以确保在函数结束时减少计数
 		c.wg.Add(1)
 
 		// 在新的 goroutine 中执行更新操作
 		go func() {
-			// 在函数退出时将 ConsumerInstance 的模式恢复为正常模式
+			// 在函数退出时将 consumerInstance 的模式恢复为正常模式
 			defer atomic.StoreInt32(&c.mode, ConsumerInstance_mode_normal)
 
 			// 获取连接和释放连接的函数
@@ -473,26 +496,23 @@ func (c *ConsumerInstance) UpdateConsumerGroupFollowPartition(p *partition) {
 						GroupTerm:  c.term,
 					},
 				})
-				if RpcErr != nil {
+				if RpcErr != nil || i.Response.Mode != api.Response_Success {
 					// 调用远程服务失败，记录日志并退出更新操作
 					log.Printf("Failed to update, remote service call failed: %v", err)
-					return
+					continue
 				}
-
-				// 释放连接
 				s()
-
 				// 处理更新结果
 				c.handleUpdateRes(i)
 			}
 		}()
 	} else {
-		// 如果无法将 ConsumerInstance 的模式从正常模式切换到更新模式，则直接返回
+		// 如果无法将 consumerInstance 的模式从正常模式切换到更新模式，则直接返回
 		return
 	}
 }
 
-func (c *ConsumerInstance) handleUpdateRes(res *api.CheckSourceTermResponse) {
+func (c *consumerInstance) handleUpdateRes(res *api.CheckSourceTermResponse) {
 	for _, part := range res.ConsumersData.FcParts {
 		var mem = make([]struct{ ID, Url string }, 0)
 		for _, broker := range part.Part.Brokers {
@@ -505,10 +525,171 @@ func (c *ConsumerInstance) handleUpdateRes(res *api.CheckSourceTermResponse) {
 	c.term = res.GroupTerm
 }
 
-func (c *ConsumerInstance) delPartition(part *partition) error {
+func (c *consumerInstance) delPartition(part *partition) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.followPart, part.p)
 	_ = part.bks.destroy()
 	return nil
+}
+
+func (c *consumerInstance) feasibility_test() error {
+	if atomic.LoadInt32(&c.mode) == ConsumerInstance_mode_normal {
+		return nil
+	}
+	// 检查 Self 字段是否有值
+	if c.Self == nil {
+		return errors.New("Self credentials not set")
+	}
+
+	// 检查 Group 字段是否有值
+	if c.Group == nil {
+		return errors.New("Group credentials not set")
+	}
+
+	// 检查 ConsumerID 字段是否有值
+	if c.ConsumerID == "" {
+		return errors.New("ConsumerID not set")
+	}
+
+	// 检查 ConsumerGroupID 字段是否有值
+	if c.ConsumerGroupID == "" {
+		return errors.New("ConsumerGroupID not set")
+	}
+
+	// 检查 getPartFunc 字段是否有值
+	if c.getPartFunc == nil {
+		return errors.New("GetPartFunc not set")
+	}
+
+	// 检查 MsgChan 字段是否有值
+	if c.MsgChan == nil {
+		return errors.New("MsgChan not set")
+	}
+
+	// 如果所有字段都有值，则返回 nil
+	atomic.StoreInt32(&c.mode, ConsumerInstance_mode_normal)
+	return nil
+}
+
+// todo
+// 注册逻辑
+
+func (c *consumerInstance) setConsumerID(ConsumerID string) error {
+	if atomic.LoadInt32(&c.mode) != ConsumerInstance_mode_Uncheck {
+		return errors.New("consumerInstance is already built")
+	}
+	c.ConsumerID = ConsumerID
+	res, err := c.register.clientEnd.RegisterConsumer(context.Background(), &api.RegisterConsumerRequest{
+		MaxReturnMessageSize:    c.maxWindowSize,
+		MaxReturnMessageEntries: c.defaultGetEntryNum,
+		TimeoutSessionMsec:      c.timeoutSessions,
+	})
+	if err != nil {
+		return err
+	} else {
+		if res.Response.Mode != api.Response_Success {
+			return errors.New("Register consumer failed with unexpected response mode ")
+		}
+		c.Self = res.Credential
+		c.Key = res.Credential.Key
+	}
+	return nil
+}
+
+const (
+	RegisterConsumerGroupRequest_Latest   api.RegisterConsumerGroupRequest_PullOptionMode = 0
+	RegisterConsumerGroupRequest_Earliest api.RegisterConsumerGroupRequest_PullOptionMode = 3
+)
+
+func (c *consumerInstance) setConsumerGroupID(ConsumerGroupID string, mode api.RegisterConsumerGroupRequest_PullOptionMode) error {
+	if atomic.LoadInt32(&c.mode) != ConsumerInstance_mode_Uncheck {
+		return errors.New("consumerInstance is already built")
+	}
+	c.ConsumerGroupID = ConsumerGroupID
+	res, err := c.register.clientEnd.RegisterConsumerGroup(context.Background(), &api.RegisterConsumerGroupRequest{
+		PullOption: mode,
+		GroupId:    &c.ConsumerGroupID,
+	})
+	if err != nil {
+		return err
+	} else {
+		if res.Response.Mode != api.Response_Success {
+			if res.Response.Mode == api.Response_ErrSourceAlreadyExist {
+				res, err := c.register.clientEnd.JoinConsumerGroup(context.Background(), &api.JoinConsumerGroupRequest{
+					Cred:            c.Self,
+					ConsumerGroupId: c.ConsumerGroupID,
+				})
+				if err != nil {
+					return err
+				} else {
+					c.term = res.GroupTerm
+					c.Group = &api.Credentials{
+						Identity: api.Credentials_ConsumerGroup,
+						Id:       c.ConsumerGroupID,
+						Key:      c.Self.Key,
+					}
+					return nil
+				}
+			}
+			return errors.New("Register consumer failed with unexpected response mode ")
+		} else {
+			c.term = res.GroupTerm
+			c.Group = res.Cred
+			return nil
+		}
+	}
+}
+func (c *consumerInstance) joinOtherGroup(ConsumerGroupID string) error {
+	if atomic.LoadInt32(&c.mode) != ConsumerInstance_mode_Uncheck {
+		return errors.New("consumerInstance is already built")
+	}
+	return nil
+}
+func (c *consumerInstance) groupFollowTopic(topic string) error {
+	if atomic.LoadInt32(&c.mode) != ConsumerInstance_mode_Uncheck {
+		return errors.New("consumerInstance is already built")
+	}
+	return nil
+}
+func (c *consumerInstance) groupUnFollowTopic(topic string) error {
+	if atomic.LoadInt32(&c.mode) != ConsumerInstance_mode_Uncheck {
+		return errors.New("consumerInstance is already built")
+	}
+	return nil
+}
+func (c *consumerInstance) setWindowSize(id string) error {
+	if atomic.LoadInt32(&c.mode) != ConsumerInstance_mode_Uncheck {
+		return errors.New("consumerInstance is already built")
+	}
+	return nil
+}
+func (c *consumerInstance) setTimeOutSession(id string) error {
+	if atomic.LoadInt32(&c.mode) != ConsumerInstance_mode_Uncheck {
+		return errors.New("consumerInstance is already built")
+	}
+	return nil
+}
+func (c *consumerInstance) setDefaultGetEntryNum(id string) error {
+	if atomic.LoadInt32(&c.mode) != ConsumerInstance_mode_Uncheck {
+		return errors.New("consumerInstance is already built")
+	}
+	return nil
+}
+func (c *consumerInstance) setMaxWindowSize(id string) error {
+	if atomic.LoadInt32(&c.mode) != ConsumerInstance_mode_Uncheck {
+		return errors.New("consumerInstance is already built")
+	}
+	return nil
+}
+
+func (c *consumerInstance) setKey(id string) error {
+	if atomic.LoadInt32(&c.mode) != ConsumerInstance_mode_Uncheck {
+		return errors.New("consumerInstance is already built")
+	}
+	return nil
+}
+
+func (c *consumerInstance) build() error {
+	return c.feasibility_test()
 }
