@@ -1,4 +1,4 @@
-package BorsMQ_Client_go
+package yarMessageQueueC
 
 import (
 	"MqClient/common"
@@ -9,6 +9,7 @@ import (
 	"github.com/YarBor/BorsMqServer/api"
 	"google.golang.org/grpc"
 	"log"
+	"math/rand"
 	"sort"
 	"strconv"
 	"sync"
@@ -22,42 +23,43 @@ type MsgData struct {
 	Ack  func()
 }
 
-type Consumer_ClientEnd interface {
+type ConsumerEnd interface {
 	Pull() (*MsgData, error)
 }
 
-type Manager interface {
+type Handler interface {
 	LeaveAndJoinGroup(string, registerConsumerGroupOption) error
-	FollowTopic(string) error
-	UnfollowTopic(string) error
+	GroupFollowTopic(string) error
+	GroupUnfollowTopic(string) error
 	ConnClose()
 }
 
 var servicesMtx = sync.RWMutex{}
-var services map[string]struct {
-	l         *link
-	followNum int32
-} //brokerID to link
 
-type link struct {
+var services map[string]struct {
+	l         *stream
+	followNum int32
+} //brokerID to stream
+
+type stream struct {
 	id        string
 	url       string
 	conn      *grpc.ClientConn
 	clientEnd api.MqServerCallClient
 }
 
-func getLink(ID string) (*link, error) {
+func getStream(ID string) (*stream, error) {
 	servicesMtx.RLock()
 	defer servicesMtx.RUnlock()
 	data, ok := services[ID]
 	if ok {
 		return data.l, nil
 	} else {
-		return nil, fmt.Errorf("Link Not Exist: %v", ID)
+		return nil, fmt.Errorf("stream Not Exist: %v", ID)
 	}
 }
 
-func newLink(ID, Url string) (*link, error) {
+func newStream(ID, Url string) (*stream, error) {
 	servicesMtx.Lock()
 	defer servicesMtx.Unlock()
 	if l, ok := services[ID]; ok {
@@ -67,20 +69,20 @@ func newLink(ID, Url string) (*link, error) {
 	if err != nil {
 		return nil, err
 	}
-	l := link{
+	l := stream{
 		id:        ID,
 		url:       Url,
 		conn:      conn,
 		clientEnd: api.NewMqServerCallClient(conn),
 	}
 	services[ID] = struct {
-		l         *link
+		l         *stream
 		followNum int32
 	}{l: &l, followNum: 0}
 	return &l, nil
 }
 
-func addLinkFollowerNum(ID string, num int) error {
+func addStreamFollowerNum(ID string, num int) error {
 	servicesMtx.Lock()
 	defer servicesMtx.Unlock()
 	i, ok := services[ID]
@@ -92,7 +94,7 @@ func addLinkFollowerNum(ID string, num int) error {
 	}
 }
 
-func removeLinkFollowerNum(ID string, num int) error {
+func removeStreamFollowerNum(ID string, num int) error {
 	servicesMtx.Lock()
 	defer servicesMtx.Unlock()
 	i, ok := services[ID]
@@ -107,51 +109,60 @@ func removeLinkFollowerNum(ID string, num int) error {
 }
 
 type brokersGroup struct {
-	members     []struct{ ID, Url string }
+	*api.Partition
 	activeIndex int32
 }
 
 func newBrokersGroup(members ...struct{ ID, Url string }) (*brokersGroup, error) {
+	res := &brokersGroup{}
 	for _, member := range members {
-		err := addLinkFollowerNum(member.ID, 1)
+		err := addStreamFollowerNum(member.ID, 1)
 		if err != nil {
-			_, err = newLink(member.ID, member.Url)
+			_, err = newStream(member.ID, member.Url)
 			if err != nil {
 				return nil, err
 			}
-			err = addLinkFollowerNum(member.ID, 1)
+			err = addStreamFollowerNum(member.ID, 1)
 		}
+		res.Brokers = append(res.Brokers, &api.BrokerData{
+			Id:  member.ID,
+			Url: member.Url,
+		})
 	}
-	return &brokersGroup{members: members}, nil
+	return res, nil
 }
 
 func (s *brokersGroup) destroy() error {
-	for _, member := range s.members {
-		_ = removeLinkFollowerNum(member.ID, 1)
+	for _, member := range s.Brokers {
+		_ = removeStreamFollowerNum(member.Id, 1)
 	}
 	return nil
 }
 
 var reTryTimes = 3
 
-func (s *brokersGroup) GetLink() (func() (*link, error), func()) {
+func (s *brokersGroup) GetStream() (get func() (*stream, error), setActiveIndex func()) {
 	index := atomic.LoadInt32(&s.activeIndex)
-	var Len = int32(len(s.members))
+	var Len = int32(len(s.Brokers))
+	if index == -1 {
+		index = int32(rand.Intn(int(Len)))
+	}
 	var getManyTimes int32 = -1
-	return func() (*link, error) {
+	return func() (*stream, error) {
 			getManyTimes += 1
 			if getManyTimes > Len*int32(reTryTimes) {
 				return nil, fmt.Errorf("exceeded Retry times ")
 			}
-			l, err := getLink(s.members[index].ID)
+			l, err := getStream(s.Brokers[index].Id)
 			if err != nil {
-				l, err = newLink(s.members[index].ID, s.members[index].Url)
+				l, err = newStream(s.Brokers[index].Id, s.Brokers[index].Url)
 			}
 			index = (1 + index) % Len
 			return l, err
 		}, func() {
 			if getManyTimes > 0 && getManyTimes <= Len*int32(reTryTimes) {
 				atomic.StoreInt32(&s.activeIndex, (index+Len-1)%Len)
+				getManyTimes = -1
 			}
 		}
 }
@@ -198,13 +209,13 @@ func (p *partition) Pull(
 	Part string,
 ) (*api.PullMessageResponse, error) {
 	p.mu.RLock()
-	f, s := p.bks.GetLink()
+	f, s := p.bks.GetStream()
 	p.mu.RUnlock()
 	for {
-		l, errGetLink := f()
-		if errGetLink != nil {
-			log.Printf("Failed to get link for partition Topic=%s, Part=%s: %v", Topic, Part, errGetLink.Error())
-			return nil, errGetLink
+		l, errGetStream := f()
+		if errGetStream != nil {
+			log.Printf("Failed to get stream for partition Topic=%s, Part=%s: %v", Topic, Part, errGetStream.Error())
+			return nil, errGetStream
 		}
 		res, err := l.clientEnd.PullMessage(context.Background(), &api.PullMessageRequest{
 			Group:          Group,
@@ -226,7 +237,7 @@ func (p *partition) Pull(
 			s()
 			return res, nil
 		} else {
-			log.Printf("Received an unexpected response mode for partition Topic=%s, Part=%s: %v", Topic, Part, res.Response.Mode.String())
+			log.Printf("Received an unexpected response check for partition Topic=%s, Part=%s: %v", Topic, Part, res.Response.Mode.String())
 		}
 	}
 }
@@ -238,10 +249,10 @@ const (
 )
 
 type consumerInstance struct {
-	mode            int32
+	check           int32
 	Self            *api.Credentials
 	Group           *api.Credentials
-	register        *link
+	register        *stream
 	Key             string
 	ConsumerID      string
 	ConsumerGroupID string
@@ -263,7 +274,7 @@ func (c *consumerInstance) LeaveAndJoinGroup(s string, mode registerConsumerGrou
 	return c.joinOtherGroup(s, mode)
 }
 
-func (c *consumerInstance) FollowTopic(s string) error {
+func (c *consumerInstance) GroupFollowTopic(s string) error {
 	res, err := c.register.clientEnd.SubscribeTopic(context.Background(), &api.SubscribeTopicRequest{
 		CGCred: c.Group,
 		Tp:     s,
@@ -277,7 +288,7 @@ func (c *consumerInstance) FollowTopic(s string) error {
 	}
 }
 
-func (c *consumerInstance) UnfollowTopic(s string) error {
+func (c *consumerInstance) GroupUnfollowTopic(s string) error {
 	res, err := c.register.clientEnd.UnSubscribeTopic(context.Background(), &api.UnSubscribeTopicRequest{
 		CGCred: c.Group,
 		Tp:     s,
@@ -297,7 +308,7 @@ func (c *consumerInstance) ConnClose() {
 
 func newConsumerInstance() *consumerInstance {
 	return &consumerInstance{
-		mode:                ConsumerInstance_mode_Uncheck,
+		check:               ConsumerInstance_mode_Uncheck,
 		Self:                nil,
 		Group:               nil,
 		ConsumerID:          "",
@@ -367,7 +378,7 @@ func (c *consumerInstance) Pull() (*MsgData, error) {
 }
 
 func (c *consumerInstance) PullwithNum(GetEntryNum int32) (*MsgData, error) {
-	if atomic.LoadInt32(&c.mode) == ConsumerInstance_mode_Uncheck {
+	if atomic.LoadInt32(&c.check) == ConsumerInstance_mode_Uncheck {
 		return nil, errors.New("Need To Build Consumer Instance ")
 	}
 start:
@@ -392,7 +403,7 @@ start:
 }
 
 func (c *consumerInstance) registerPartition(p string, members ...struct{ ID, Url string }) error {
-	if atomic.LoadInt32(&c.mode) == ConsumerInstance_mode_Uncheck {
+	if atomic.LoadInt32(&c.check) == ConsumerInstance_mode_Uncheck {
 		return errors.New("Need To Build Consumer Instance ")
 	}
 	c.mu.Lock()
@@ -501,25 +512,25 @@ func (c *consumerInstance) goPullHeartbeat(p *partition) {
 
 // UpdateConsumerGroupFollowPartition 用于更新消费者组跟随的分区信息。
 func (c *consumerInstance) UpdateConsumerGroupFollowPartition() {
-	if atomic.LoadInt32(&c.mode) == ConsumerInstance_mode_Uncheck {
+	if atomic.LoadInt32(&c.check) == ConsumerInstance_mode_Uncheck {
 		log.Print(errors.New("Need To Build Consumer Instance ").Error())
 		return
 	}
 	// 检查并尝试将 consumerInstance 的模式从正常模式切换到更新模式
-	if atomic.CompareAndSwapInt32(&c.mode, ConsumerInstance_mode_Working, ConsumerInstance_mode_updating) {
+	if atomic.CompareAndSwapInt32(&c.check, ConsumerInstance_mode_Working, ConsumerInstance_mode_updating) {
 		// 增加 WaitGroup 的计数，以确保在函数结束时减少计数
 		c.wg.Add(1)
 
 		// 在新的 goroutine 中执行更新操作
 		go func() {
 			// 在函数退出时将 consumerInstance 的模式恢复为正常模式
-			defer atomic.StoreInt32(&c.mode, ConsumerInstance_mode_Working)
+			defer atomic.StoreInt32(&c.check, ConsumerInstance_mode_Working)
 
 			// 获取连接和释放连接的函数
-			link := c.register
+			Stream := c.register
 
 			// 调用远程服务检查源端信息
-			i, RpcErr := link.clientEnd.CheckSourceTerm(context.Background(), &api.CheckSourceTermRequest{
+			i, RpcErr := Stream.clientEnd.CheckSourceTerm(context.Background(), &api.CheckSourceTermRequest{
 				Self: c.Group,
 				ConsumerData: &api.CheckSourceTermRequest_ConsumerCheck{
 					ConsumerId: &c.Self.Id,
@@ -530,6 +541,7 @@ func (c *consumerInstance) UpdateConsumerGroupFollowPartition() {
 			if RpcErr != nil || i.Response.Mode != api.Response_Success {
 				// 调用远程服务失败，记录日志并退出更新操作
 				log.Printf("Failed to update, remote service call failed: %v", RpcErr)
+				return
 			}
 			// 处理更新结果
 			c.handleUpdateRes(i)
@@ -562,7 +574,7 @@ func (c *consumerInstance) delPartition(part *partition) error {
 }
 
 func (c *consumerInstance) feasibility_test() error {
-	if atomic.LoadInt32(&c.mode) == ConsumerInstance_mode_Working {
+	if atomic.LoadInt32(&c.check) == ConsumerInstance_mode_Working {
 		return nil
 	}
 	// 检查 Self 字段是否有值
@@ -596,15 +608,12 @@ func (c *consumerInstance) feasibility_test() error {
 	}
 
 	// 如果所有字段都有值，则返回 nil
-	atomic.StoreInt32(&c.mode, ConsumerInstance_mode_Working)
+	atomic.StoreInt32(&c.check, ConsumerInstance_mode_Working)
 	return nil
 }
 
-// todo
-// 注册逻辑
-
 func (c *consumerInstance) setConsumerID(ConsumerID string) error {
-	if atomic.LoadInt32(&c.mode) != ConsumerInstance_mode_Uncheck {
+	if atomic.LoadInt32(&c.check) != ConsumerInstance_mode_Uncheck {
 		return errors.New("consumerInstance is already built")
 	}
 	c.ConsumerID = ConsumerID
@@ -617,7 +626,7 @@ func (c *consumerInstance) setConsumerID(ConsumerID string) error {
 		return err
 	} else {
 		if res.Response.Mode != api.Response_Success {
-			return errors.New("Register consumer failed with unexpected response mode ")
+			return errors.New("Register consumer failed with unexpected response check ")
 		}
 		c.Self = res.Credential
 		c.Key = res.Credential.Key
@@ -633,7 +642,7 @@ const (
 )
 
 func (c *consumerInstance) setConsumerGroupID(ConsumerGroupID string, mode_ifNonexistent registerConsumerGroupOption) error {
-	if atomic.LoadInt32(&c.mode) != ConsumerInstance_mode_Uncheck {
+	if atomic.LoadInt32(&c.check) != ConsumerInstance_mode_Uncheck {
 		return errors.New("consumerInstance is already built")
 	}
 	if c.Self == nil {
@@ -669,7 +678,7 @@ func (c *consumerInstance) setConsumerGroupID(ConsumerGroupID string, mode_ifNon
 					return nil
 				}
 			}
-			return errors.New("Register consumer failed with unexpected response mode ")
+			return errors.New("Register consumer failed with unexpected response check ")
 		} else {
 			c.term = res.GroupTerm
 			c.Group = res.Cred
@@ -679,7 +688,7 @@ func (c *consumerInstance) setConsumerGroupID(ConsumerGroupID string, mode_ifNon
 }
 func (c *consumerInstance) joinOtherGroup(ConsumerGroupID string, mode_ifNonexistent registerConsumerGroupOption) error {
 reset:
-	switch atomic.LoadInt32(&c.mode) {
+	switch atomic.LoadInt32(&c.check) {
 	case ConsumerInstance_mode_Uncheck:
 		return c.setConsumerGroupID(ConsumerGroupID, mode_ifNonexistent)
 	case ConsumerInstance_mode_Working:
@@ -701,7 +710,7 @@ reset:
 }
 func (c *consumerInstance) groupFollowTopic(topic string) error {
 reset:
-	switch atomic.LoadInt32(&c.mode) {
+	switch atomic.LoadInt32(&c.check) {
 	case ConsumerInstance_mode_Uncheck,
 		ConsumerInstance_mode_Working:
 		res, err := c.register.clientEnd.SubscribeTopic(context.Background(), &api.SubscribeTopicRequest{
@@ -725,7 +734,7 @@ reset:
 }
 func (c *consumerInstance) groupUnFollowTopic(topic string) error {
 reset:
-	switch atomic.LoadInt32(&c.mode) {
+	switch atomic.LoadInt32(&c.check) {
 	case ConsumerInstance_mode_Uncheck,
 		ConsumerInstance_mode_Working:
 		res, err := c.register.clientEnd.UnSubscribeTopic(context.Background(), &api.UnSubscribeTopicRequest{
@@ -748,7 +757,7 @@ reset:
 	return nil
 }
 func (c *consumerInstance) setTimeOutSession_ms(Session_ms string) error {
-	if atomic.LoadInt32(&c.mode) != ConsumerInstance_mode_Uncheck {
+	if atomic.LoadInt32(&c.check) != ConsumerInstance_mode_Uncheck {
 		return errors.New("consumerInstance is already built")
 	}
 	i, err := strconv.Atoi(Session_ms)
@@ -762,8 +771,9 @@ func (c *consumerInstance) setTimeOutSession_ms(Session_ms string) error {
 	}
 	return nil
 }
+
 func (c *consumerInstance) setDefaultGetEntryNum(Num string) error {
-	if atomic.LoadInt32(&c.mode) != ConsumerInstance_mode_Uncheck {
+	if atomic.LoadInt32(&c.check) != ConsumerInstance_mode_Uncheck {
 		return errors.New("consumerInstance is already built")
 	}
 	i, err := strconv.Atoi(Num)
@@ -779,7 +789,7 @@ func (c *consumerInstance) setDefaultGetEntryNum(Num string) error {
 }
 
 func (c *consumerInstance) setMaxWindowSize(Size string) error {
-	if atomic.LoadInt32(&c.mode) != ConsumerInstance_mode_Uncheck {
+	if atomic.LoadInt32(&c.check) != ConsumerInstance_mode_Uncheck {
 		return errors.New("consumerInstance is already built")
 	}
 	i, err := strconv.Atoi(Size)
@@ -795,7 +805,7 @@ func (c *consumerInstance) setMaxWindowSize(Size string) error {
 }
 
 func (c *consumerInstance) setKey(Key string) error {
-	if atomic.LoadInt32(&c.mode) != ConsumerInstance_mode_Uncheck {
+	if atomic.LoadInt32(&c.check) != ConsumerInstance_mode_Uncheck {
 		return errors.New("consumerInstance is already built")
 	}
 	c.Key = Key
@@ -803,10 +813,10 @@ func (c *consumerInstance) setKey(Key string) error {
 }
 
 func (c *consumerInstance) setServer(url string) error {
-	if atomic.LoadInt32(&c.mode) != ConsumerInstance_mode_Uncheck {
+	if atomic.LoadInt32(&c.check) != ConsumerInstance_mode_Uncheck {
 		return errors.New("consumerInstance is already built")
 	}
-	l, err := newLink("", url)
+	l, err := newStream("", url)
 	if err != nil {
 		return err
 	}
@@ -814,7 +824,7 @@ func (c *consumerInstance) setServer(url string) error {
 	return nil
 }
 
-func (c *consumerInstance) build(options ...ConsumerInstanceOptions) (Consumer_ClientEnd, Manager, error) {
+func (c *consumerInstance) build(options ...ConsumerInstanceOptions) (ConsumerEnd, Handler, error) {
 	sort.Slice(options, func(i, j int) bool {
 		return options[i].r < options[j].r
 	})
@@ -837,4 +847,89 @@ func (c *consumerInstance) build(options ...ConsumerInstanceOptions) (Consumer_C
 		return nil, nil, err
 	}
 	return c, c, nil
+}
+
+type providerInstance struct {
+	cred    *api.Credentials
+	term    *int32
+	retries int
+	timeout time.Duration
+
+	t     string
+	parts atomic.Pointer[[]*brokersGroup]
+}
+
+func (p *providerInstance) getRandPart() *brokersGroup {
+	pa := p.parts.Load()
+	if len(*pa) == 0 {
+		return nil
+	}
+	return (*pa)[rand.Intn(len(*pa))]
+}
+
+func (p *providerInstance) SyncMetadata() error {
+	get, success := p.getRandPart().GetStream()
+	c, cancel := context.WithTimeout(context.Background(), p.timeout)
+	go func() {
+		defer cancel()
+		for c.Err() != nil {
+			s, err := get()
+			if err != nil {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			success()
+			nowTerm := atomic.LoadInt32(p.term)
+			data, err := s.clientEnd.QueryTopic(c, &api.QueryTopicRequest{
+				Credential: p.cred,
+				Topic:      p.t,
+			})
+			if err != nil || data.Response.Mode != api.Response_Success {
+				log.Printf("SyncMetadata err %v, %s\n", err, data.Response.Mode.String())
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			pa := []*brokersGroup{}
+			for _, detail := range data.PartitionDetails {
+				pa = append(pa, &brokersGroup{
+					Partition:   detail,
+					activeIndex: -1,
+				})
+			}
+			if !atomic.CompareAndSwapInt32(p.term, nowTerm, data.TopicTerm) {
+				return
+			}
+			p.parts.Store(&pa)
+			return
+		}
+	}()
+	select {
+	case <-c.Done():
+	}
+	return nil
+}
+
+func (p *providerInstance) Push(msg string) error {
+	get, set := p.getRandPart().GetStream()
+	part, err := get()
+	if err != nil {
+		return err
+	}
+	set()
+	data, err := part.clientEnd.PushMessage(context.Background(), &api.PushMessageRequest{
+		Credential: p.cred,
+		Topic:      p.t,
+		Part:       part.id,
+		Msgs: &api.Message{
+			Message: [][]byte{[]byte(msg)},
+		},
+		TopicTerm: *p.term,
+	})
+	if err != nil {
+		return err
+	}
+	if data.Response.Mode != api.Response_Success {
+		return errors.New(data.Response.Mode.String())
+	}
+	return nil
 }

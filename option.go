@@ -1,4 +1,4 @@
-package BorsMQ_Client_go
+package yarMessageQueueC
 
 type optionsRank int
 type ConsumerInstanceOptions struct {
